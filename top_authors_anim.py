@@ -48,18 +48,28 @@ WEEKS_PER_SECOND = 1      # data weeks per second of video -> lower = slower
 END_HOLD_SECONDS = 1.5     # freeze on the final frame for this long
 BACKGROUND_ALPHA = 0.08    # opacity of non-top-N "context" lines
 HIGHLIGHT_LW = 2.6         # line width for the current top-N
-BACKGROUND_LW = 0.8        # line width for everyone else
+BACKGROUND_LW = 0.5        # line width for everyone else
 VIEW_WEEKS = 6           # width of the sliding viewport in the zoom animation
 Y_EASE_DAYS = 10         # ease-in/out span for the auto y-axis (0 = instant)
-DPI = 110                  # output resolution; lower = faster render, smaller video
-N_WORKERS = max(1, (os.cpu_count() or 4) - 1)  # parallel render processes
+DPI = 240                  # 8 x 4.5 inches at 240 dpi = 1920 x 1080 pixels
+VIDEO_CRF = 24             # H.264 constant-quality compression (higher = smaller)
+VIDEO_THREADS = 2          # threads per encoder; bounds total CPU/memory use
+N_WORKERS = min(6, max(1, (os.cpu_count() or 4) - 1))
+FIGURE_SIZE = (8, 4.5)
+AXES_LEFT = 0.12
+AXES_RIGHT = 0.66
+AXES_TOP = 0.90
+AXES_BOTTOM = 0.16
+HEADER_ASSET_HEIGHT = 80
 EXPORT_PATH = Path(__file__).parent / "data" / "export.xml"
+LOGO_PATH = Path(__file__).parent / "data" / "scifi_logo2a_michel.png"
+PARROT_PATH = Path(__file__).parent / "data" / "scifi_parrot.gif"
 OUTPUT_ZOOM_MP4 = Path(__file__).parent / "top5_authors_zoom.mp4"
 OUTPUT_ZOOM_FRAME = Path(__file__).parent / "top5_authors_zoom_frame.png"
 
-# Paul Tol "muted" colour-blind-safe qualitative palette (9 distinct hues).
-# Assigned to authors by how often they appear in the top-N (see build_*), so the
-# frequently-shown leaders get unique colours and rarely collide on screen.
+# Extended qualitative palette assembled from Paul Tol's muted, bright, and
+# vibrant schemes. It is large enough to keep every simultaneously highlighted
+# author distinct across the full sliding viewport.
 CB_PALETTE = [
     "#332288",  # indigo
     "#CC6677",  # rose
@@ -70,6 +80,17 @@ CB_PALETTE = [
     "#117733",  # green
     "#AA4499",  # purple
     "#DDCC77",  # sand
+    "#4477AA",  # blue
+    "#EE6677",  # coral
+    "#228833",  # emerald
+    "#CCBB44",  # mustard
+    "#66CCEE",  # sky
+    "#AA3377",  # magenta
+    "#0077BB",  # strong blue
+    "#EE7733",  # orange
+    "#009988",  # turquoise
+    "#EE3377",  # pink
+    "#CC3311",  # red
 ]
 
 
@@ -124,6 +145,52 @@ def _short_name(name: str) -> str:
     """Compact author label: 'First Last Extra' -> 'First L.' to fit the gutter."""
     parts = name.split()
     return f"{parts[0]} {parts[-1][0]}." if len(parts) >= 2 else name
+
+
+def _assign_viewport_colors(x, authors, top_per_time, view) -> dict[str, str]:
+    """Assign distinct colors to authors highlighted in the same viewport."""
+    frequency = {author: 0 for author in authors}
+    adjacency: dict[str, set[str]] = {author: set() for author in authors}
+    palette_rgb = [np.asarray(mpl.colors.to_rgb(color)) for color in CB_PALETTE]
+
+    for index, names in enumerate(top_per_time):
+        for author in names:
+            frequency[author] += 1
+
+        lo = int(np.searchsorted(x, x[index] - view, side="left"))
+        visible = set().union(*top_per_time[lo : index + 1])
+        for author in visible:
+            adjacency[author].update(visible - {author})
+
+    color_indices: dict[str, int] = {}
+    while len(color_indices) < len(authors):
+        unassigned = [author for author in authors if author not in color_indices]
+        author = max(
+            unassigned,
+            key=lambda name: (
+                len({color_indices[n] for n in adjacency[name] if n in color_indices}),
+                len(adjacency[name]),
+                frequency[name],
+                name,
+            ),
+        )
+        used = {color_indices[n] for n in adjacency[author] if n in color_indices}
+        available = [index for index in range(len(CB_PALETTE)) if index not in used]
+        if not available:
+            raise ValueError("CB_PALETTE is too small for conflict-free viewport colors")
+        color_indices[author] = (
+            max(
+                available,
+                key=lambda index: min(
+                    np.linalg.norm(palette_rgb[index] - palette_rgb[neighbor])
+                    for neighbor in used
+                ),
+            )
+            if used
+            else available[0]
+        )
+
+    return {author: CB_PALETTE[index] for author, index in color_indices.items()}
 
 
 def rolling_top_authors(
@@ -222,27 +289,10 @@ def build_zoom_animation(weeks, series, top_per_week, max_roll):
     authors = sorted(series)
     series_arr = {a: np.asarray(series[a], dtype=float) for a in authors}
 
-    # Greedy graph-colouring so authors sharing a top-N day never get the same
-    # colour: the labelled top-N is therefore always mutually distinguishable.
-    # Authors are coloured most-frequent-first and pick the first palette colour
-    # not used by a same-day neighbour (neutral grey only if the palette is
-    # exhausted among neighbours, which is rare with TOP_N small).
-    freq: dict[str, int] = {}
-    adjacency: dict[str, set[str]] = {a: set() for a in authors}
-    for names in top_per_week:
-        for name in names:
-            freq[name] = freq.get(name, 0) + 1
-        for a in names:
-            adjacency[a].update(n for n in names if n != a)
+    colors = _assign_viewport_colors(x, authors, top_per_week, view)
 
-    TAIL_COLOR = "0.45"
-    colors: dict[str, str] = {}
-    for a in sorted(authors, key=lambda a: freq.get(a, 0), reverse=True):
-        used = {colors[b] for b in adjacency[a] if b in colors}
-        colors[a] = next((c for c in CB_PALETTE if c not in used), TAIL_COLOR)
-
-    fig, ax = plt.subplots(figsize=(8, 4.5))
-    fig.subplots_adjust(left=0.12, right=0.66, top=0.90, bottom=0.16)
+    fig, ax = plt.subplots(figsize=FIGURE_SIZE)
+    fig.subplots_adjust(left=AXES_LEFT, right=AXES_RIGHT, top=AXES_TOP, bottom=AXES_BOTTOM)
     ax.set_title("lblogbook.cern.ch/SciFi", fontsize=13, fontweight="bold")
 
     lines: dict[str, mpl.lines.Line2D] = {}
@@ -267,12 +317,13 @@ def build_zoom_animation(weeks, series, top_per_week, max_roll):
     formatter.offset_formats[2] = "%Y"      # context shown once, on the right
     ax.xaxis.set_major_locator(locator)
     ax.xaxis.set_major_formatter(formatter)
+    ax.xaxis.get_offset_text().set_fontsize(12)
     ax.xaxis.get_offset_text().set_fontweight("bold")
     ax.yaxis.set_major_locator(mticker.MaxNLocator(nbins=6, integer=True, min_n_ticks=2))
     ax.set_ylabel("Avg. N. of Logs per Week", fontsize=11)
     ax.yaxis.set_label_coords(-0.11, 0.5)
     ax.tick_params(labelsize=11)
-    ax.grid(True, alpha=0.2)
+    ax.grid(False)
 
     n = len(weeks)
     # Per-sample tallest visible value, then eased so the y-axis accelerates and
@@ -374,11 +425,22 @@ def _render_segment(payload) -> str:
     """
     data, lo, hi, seg_path = payload
     _anim, fig, update = build_zoom_animation(*data)
-    writer = FFMpegWriter(fps=FPS, bitrate=2400)
+    writer = FFMpegWriter(
+        fps=FPS,
+        codec="libx264",
+        bitrate=-1,
+        extra_args=[
+            "-preset", "medium",
+            "-crf", str(VIDEO_CRF),
+            "-threads", str(VIDEO_THREADS),
+            "-pix_fmt", "yuv420p",
+        ],
+    )
     with writer.saving(fig, seg_path, dpi=DPI):
         for f in range(lo, hi):
             update(f)
             writer.grab_frame()
+    _anim._draw_was_started = True
     plt.close(fig)
     return seg_path
 
@@ -391,6 +453,7 @@ def _render_parallel(data, mp4_path, frame_path, title, workers=N_WORKERS):
     _anim, fig, update = build_zoom_animation(*data)
     update(n_frames - 1)
     fig.savefig(frame_path, dpi=DPI)
+    _anim._draw_was_started = True
     plt.close(fig)
     print(f"Saved frame preview -> {frame_path.name}")
 
@@ -429,6 +492,79 @@ def _render_parallel(data, mp4_path, frame_path, title, workers=N_WORKERS):
     print(f"Saved animation -> {mp4_path.name}")
 
 
+def _header_overlay_filter() -> str:
+    """Build the ffmpeg filter that anchors both assets around the title."""
+    header_bottom = 1 - AXES_TOP
+    return (
+        f"[1:v]format=rgba,scale=-1:{HEADER_ASSET_HEIGHT}:flags=lanczos[logo];"
+        f"[2:v]format=rgba,scale=-1:{HEADER_ASSET_HEIGHT}:flags=neighbor[parrot];"
+        f"[0:v][logo]overlay=x={AXES_LEFT}*main_w:"
+        f"y={header_bottom}*main_h-overlay_h:format=auto:shortest=1[with_logo];"
+        f"[with_logo][parrot]overlay=x={AXES_RIGHT}*main_w-overlay_w:"
+        f"y={header_bottom}*main_h-overlay_h:format=auto:shortest=1[outv]"
+    )
+
+
+def _overlay_header_assets(mp4_path: Path, frame_path: Path) -> None:
+    """Add the static logo and looping GIF after the chart has rendered."""
+    for asset_path in (LOGO_PATH, PARROT_PATH):
+        if not asset_path.is_file():
+            raise FileNotFoundError(f"Missing header asset: {asset_path}")
+
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    overlay_filter = _header_overlay_filter()
+    video_tmp = mp4_path.with_name(f".{mp4_path.stem}.overlay{mp4_path.suffix}")
+    frame_tmp = frame_path.with_name(f".{frame_path.stem}.overlay{frame_path.suffix}")
+
+    print("Adding header logo and looping parrot...")
+    try:
+        subprocess.run(
+            [
+                ffmpeg, "-y",
+                "-i", str(frame_path),
+                "-i", str(LOGO_PATH),
+                "-ignore_loop", "1", "-i", str(PARROT_PATH),
+                "-filter_complex", overlay_filter,
+                "-map", "[outv]",
+                "-frames:v", "1",
+                "-update", "1",
+                str(frame_tmp),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            [
+                ffmpeg, "-y",
+                "-i", str(mp4_path),
+                "-loop", "1", "-i", str(LOGO_PATH),
+                "-ignore_loop", "0", "-i", str(PARROT_PATH),
+                "-filter_complex", overlay_filter,
+                "-map", "[outv]",
+                "-map", "0:a?",
+                "-map_metadata", "0",
+                "-c:v", "libx264",
+                "-preset", "medium",
+                "-crf", str(VIDEO_CRF),
+                "-threads", str(VIDEO_THREADS),
+                "-pix_fmt", "yuv420p",
+                "-c:a", "copy",
+                "-movflags", "+faststart",
+                "-shortest",
+                str(video_tmp),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        os.replace(frame_tmp, frame_path)
+        os.replace(video_tmp, mp4_path)
+    finally:
+        frame_tmp.unlink(missing_ok=True)
+        video_tmp.unlink(missing_ok=True)
+
+    print(f"Added header assets -> {frame_path.name}, {mp4_path.name}")
+
+
 def main() -> None:
     import sys
     import time
@@ -441,6 +577,7 @@ def main() -> None:
 
     t0 = time.perf_counter()
     _render_parallel(data, OUTPUT_ZOOM_MP4, OUTPUT_ZOOM_FRAME, "Top-5 ELOG authors", workers)
+    _overlay_header_assets(OUTPUT_ZOOM_MP4, OUTPUT_ZOOM_FRAME)
     print(f"Done in {time.perf_counter() - t0:.1f}s")
 
 
