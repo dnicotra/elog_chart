@@ -1,4 +1,5 @@
 /.claude
 /.venv
 *.mp4
+/data/export.xml
 /__pycache__
