@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from datetime import timedelta
+from datetime import date, timedelta
 from pathlib import Path
 
 import imageio_ffmpeg
@@ -40,6 +40,11 @@ from matplotlib.animation import FFMpegWriter, FuncAnimation  # noqa: E402
 from elog_parser import parse_export  # noqa: E402
 
 # --- Tunables --------------------------------------------------------------
+START_DATE: str | None = None  # inclusive UTC date, "YYYY-MM-DD"; None = first entry
+END_DATE: str | None = None    # inclusive UTC date, "YYYY-MM-DD"; None = last entry
+TITLE = "lblogbook.cern.ch/SciFi"
+INCLUDE_LOGO = True
+INCLUDE_PARROT = True
 WINDOW_WEEKS = 4           # rolling window length for the per-author count
 SAMPLES_PER_WEEK = 7       # time resolution: 7 = daily sampling (smoother lines)
 TOP_N = 5                  # how many authors to highlight each frame
@@ -92,6 +97,34 @@ CB_PALETTE = [
     "#EE3377",  # pink
     "#CC3311",  # red
 ]
+
+
+def _parse_date_bound(value: str | None, name: str) -> date | None:
+    if value is None:
+        return None
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f'{name} must use the "YYYY-MM-DD" format, got {value!r}') from exc
+
+
+def filter_date_range(
+    df: pl.DataFrame, start_date: str | None = START_DATE, end_date: str | None = END_DATE
+) -> pl.DataFrame:
+    """Keep entries within the inclusive UTC calendar-date range."""
+    start = _parse_date_bound(start_date, "START_DATE")
+    end = _parse_date_bound(end_date, "END_DATE")
+    if start is not None and end is not None and start > end:
+        raise ValueError("START_DATE must be on or before END_DATE")
+
+    entry_date = pl.col("date").dt.date()
+    if start is not None:
+        df = df.filter(entry_date >= start)
+    if end is not None:
+        df = df.filter(entry_date <= end)
+    if df.is_empty():
+        raise ValueError("No ELOG entries fall within START_DATE and END_DATE")
+    return df
 
 
 def _samples_per_second() -> float:
@@ -293,7 +326,7 @@ def build_zoom_animation(weeks, series, top_per_week, max_roll):
 
     fig, ax = plt.subplots(figsize=FIGURE_SIZE)
     fig.subplots_adjust(left=AXES_LEFT, right=AXES_RIGHT, top=AXES_TOP, bottom=AXES_BOTTOM)
-    ax.set_title("lblogbook.cern.ch/SciFi", fontsize=13, fontweight="bold")
+    ax.set_title(TITLE, fontsize=13, fontweight="bold")
 
     lines: dict[str, mpl.lines.Line2D] = {}
     for a in authors:
@@ -492,38 +525,79 @@ def _render_parallel(data, mp4_path, frame_path, title, workers=N_WORKERS):
     print(f"Saved animation -> {mp4_path.name}")
 
 
-def _header_overlay_filter() -> str:
-    """Build the ffmpeg filter that anchors both assets around the title."""
+def _header_overlay_filter(
+    include_logo: bool = INCLUDE_LOGO, include_parrot: bool = INCLUDE_PARROT
+) -> str:
+    """Build the ffmpeg filter for the enabled header assets."""
+    if not include_logo and not include_parrot:
+        raise ValueError("At least one header asset must be enabled")
+
     header_bottom = 1 - AXES_TOP
-    return (
-        f"[1:v]format=rgba,scale=-1:{HEADER_ASSET_HEIGHT}:flags=lanczos[logo];"
-        f"[2:v]format=rgba,scale=-1:{HEADER_ASSET_HEIGHT}:flags=neighbor[parrot];"
-        f"[0:v][logo]overlay=x={AXES_LEFT}*main_w:"
-        f"y={header_bottom}*main_h-overlay_h:format=auto:shortest=1[with_logo];"
-        f"[with_logo][parrot]overlay=x={AXES_RIGHT}*main_w-overlay_w:"
-        f"y={header_bottom}*main_h-overlay_h:format=auto:shortest=1[outv]"
-    )
+    filters: list[str] = []
+    current_video = "[0:v]"
+    input_index = 1
+
+    if include_logo:
+        filters.append(
+            f"[{input_index}:v]format=rgba,scale=-1:{HEADER_ASSET_HEIGHT}:flags=lanczos[logo]"
+        )
+        output = "[with_logo]" if include_parrot else "[outv]"
+        filters.append(
+            f"{current_video}[logo]overlay=x={AXES_LEFT}*main_w:"
+            f"y={header_bottom}*main_h-overlay_h:format=auto:shortest=1{output}"
+        )
+        current_video = output
+        input_index += 1
+
+    if include_parrot:
+        filters.append(
+            f"[{input_index}:v]format=rgba,scale=-1:{HEADER_ASSET_HEIGHT}:flags=neighbor[parrot]"
+        )
+        filters.append(
+            f"{current_video}[parrot]overlay=x={AXES_RIGHT}*main_w-overlay_w:"
+            f"y={header_bottom}*main_h-overlay_h:format=auto:shortest=1[outv]"
+        )
+
+    return ";".join(filters)
+
+
+def _header_asset_input_args(for_video: bool) -> list[str]:
+    args: list[str] = []
+    if INCLUDE_LOGO:
+        if for_video:
+            args.extend(["-loop", "1"])
+        args.extend(["-i", str(LOGO_PATH)])
+    if INCLUDE_PARROT:
+        args.extend(["-ignore_loop", "0" if for_video else "1", "-i", str(PARROT_PATH)])
+    return args
 
 
 def _overlay_header_assets(mp4_path: Path, frame_path: Path) -> None:
-    """Add the static logo and looping GIF after the chart has rendered."""
-    for asset_path in (LOGO_PATH, PARROT_PATH):
+    """Add the enabled header assets after the chart has rendered."""
+    enabled_assets = [
+        asset_path
+        for enabled, asset_path in ((INCLUDE_LOGO, LOGO_PATH), (INCLUDE_PARROT, PARROT_PATH))
+        if enabled
+    ]
+    if not enabled_assets:
+        return
+
+    for asset_path in enabled_assets:
         if not asset_path.is_file():
             raise FileNotFoundError(f"Missing header asset: {asset_path}")
 
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
-    overlay_filter = _header_overlay_filter()
+    overlay_filter = _header_overlay_filter(INCLUDE_LOGO, INCLUDE_PARROT)
     video_tmp = mp4_path.with_name(f".{mp4_path.stem}.overlay{mp4_path.suffix}")
     frame_tmp = frame_path.with_name(f".{frame_path.stem}.overlay{frame_path.suffix}")
 
-    print("Adding header logo and looping parrot...")
+    print(f"Adding {len(enabled_assets)} header asset(s)...")
     try:
         subprocess.run(
             [
                 ffmpeg, "-y",
                 "-i", str(frame_path),
-                "-i", str(LOGO_PATH),
-                "-ignore_loop", "1", "-i", str(PARROT_PATH),
+                *_header_asset_input_args(for_video=False),
                 "-filter_complex", overlay_filter,
                 "-map", "[outv]",
                 "-frames:v", "1",
@@ -537,8 +611,7 @@ def _overlay_header_assets(mp4_path: Path, frame_path: Path) -> None:
             [
                 ffmpeg, "-y",
                 "-i", str(mp4_path),
-                "-loop", "1", "-i", str(LOGO_PATH),
-                "-ignore_loop", "0", "-i", str(PARROT_PATH),
+                *_header_asset_input_args(for_video=True),
                 "-filter_complex", overlay_filter,
                 "-map", "[outv]",
                 "-map", "0:a?",
@@ -570,13 +643,13 @@ def main() -> None:
     import time
 
     workers = int(sys.argv[1]) if len(sys.argv) > 1 else N_WORKERS
-    df = parse_export(EXPORT_PATH)
+    df = filter_date_range(parse_export(EXPORT_PATH))
     data = rolling_top_authors(df)
     weeks, series = data[0], data[1]
     print(f"{len(weeks)} weekly frames, {len(series)} candidate authors -> {workers} workers")
 
     t0 = time.perf_counter()
-    _render_parallel(data, OUTPUT_ZOOM_MP4, OUTPUT_ZOOM_FRAME, "Top-5 ELOG authors", workers)
+    _render_parallel(data, OUTPUT_ZOOM_MP4, OUTPUT_ZOOM_FRAME, TITLE, workers)
     _overlay_header_assets(OUTPUT_ZOOM_MP4, OUTPUT_ZOOM_FRAME)
     print(f"Done in {time.perf_counter() - t0:.1f}s")
 
