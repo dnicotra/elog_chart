@@ -1,6 +1,7 @@
 # ELOG author chart
 
 Creates an animated MP4 showing the most active ELOG authors over time. The input is an XML export from ELOG; the generated files are `top5_authors_zoom.mp4` and `top5_authors_zoom_frame.png`.
+![Example](top5_authors_zoom_frame.png "Example")
 
 ## Export the input from ELOG
 
