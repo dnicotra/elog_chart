@@ -10,7 +10,7 @@ Creates an animated MP4 showing the most active ELOG authors over time. The inpu
 3. Under **Export to**, select **XML**, then run the search.
 4. Save the downloaded file as `data/export.xml`.
 
-ELOG installations can customize or hide menu commands, so ask the logbook administrator if **Find** or XML export is unavailable. See the official [ELOG User's Guide](https://elog.psi.ch/elog/userguide.html#browsing-around-and-finding-things) for search behavior.
+See the official [ELOG User's Guide](https://elog.psi.ch/elog/userguide.html#browsing-around-and-finding-things).
 
 ## Run
 
